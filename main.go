@@ -3,23 +3,88 @@ package main
 import (
     "bufio"
     "database/sql"
+    "encoding/json"
     "fmt"
     "log"
     "io"
+    "net/http"
     "os"
     "os/exec"
     "os/signal"
     "strconv"
     "strings"
+    "sync"
     "syscall"
     "time"
 
     _ "github.com/mattn/go-sqlite3"
+    "github.com/urfave/negroni"
 )
 
-func save(db *sql.DB, srcIp string, srcPort int, dstIp string, dstPort int, nBytes int) error {
-    t := time.Now()
+var port = ":3000"
 
+var db *sql.DB
+var dbMutex sync.Mutex
+
+func statsHandler(w http.ResponseWriter, r *http.Request) {
+    w.Header().Set("Access-Control-Allow-Origin", "*")
+
+    switch r.Method {
+    case "GET":
+        dbMutex.Lock()
+        defer dbMutex.Unlock()
+
+        stmt, err := db.Prepare("select total(len) from packet where created_at >= ? and created_at < ?")
+        if err != nil {
+            log.Println(err)
+            w.WriteHeader(http.StatusInternalServerError)
+            return
+        }
+        defer stmt.Close()
+
+        ls := []float64{}
+        tstr := r.FormValue("date")
+        t, err := time.Parse("2006-01-02", tstr)
+        if err != nil {
+            log.Println(err)
+            w.WriteHeader(http.StatusInternalServerError)
+            return
+        }
+
+        year := t.Year()
+        month := t.Month()
+        day := t.Day()
+        for i := 0; i < 24; i++ {
+            var l float64
+            ta := time.Date(year, month, day, i, 0, 0, 0, time.UTC)
+            tb := time.Date(year, month, day, i + 1, 0, 0, 0, time.UTC)
+            if err := stmt.QueryRow(ta, tb).Scan(&l); err != nil {
+                log.Println(err)
+                w.WriteHeader(http.StatusInternalServerError)
+                return
+            }
+
+            ls = append(ls, l)
+        }
+
+        data, err := json.Marshal(ls)
+        if err != nil {
+            log.Println(err)
+            w.WriteHeader(http.StatusInternalServerError)
+            return
+        }
+
+        w.Write(data)
+    default:
+        w.WriteHeader(http.StatusMethodNotAllowed)
+    }
+}
+
+func save(srcIp string, srcPort int, dstIp string, dstPort int, nBytes int) error {
+    dbMutex.Lock()
+    defer dbMutex.Unlock()
+
+    t := time.Now()
     _, err := db.Exec(`insert into packet(src_ip, src_port, dst_ip, dst_port, len, created_at) values(?, ?, ?, ?, ?, ?)`, srcIp, srcPort, dstIp, dstPort, nBytes, t)
     if err != nil {
         return err
@@ -29,11 +94,17 @@ func save(db *sql.DB, srcIp string, srcPort int, dstIp string, dstPort int, nByt
 }
 
 func main() {
+    // Get arguments or environment variable settings
+    if tmp := os.Getenv("PORT"); tmp != "" {
+        port = ":" + tmp
+    }
+
     // Open database
-    db, err := sql.Open("sqlite3", "netlog.db")
+    tmpDb, err := sql.Open("sqlite3", "netlog.db")
     if err != nil {
         log.Fatal(err)
     }
+    db = tmpDb
 
     // Create table
     stmtStr := `create table packet(
@@ -67,6 +138,16 @@ func main() {
         fmt.Println("Received signal:", s)
         cmd.Process.Kill()
         os.Exit(0)
+    }()
+
+    // Start server
+    mux := http.NewServeMux()
+    mux.HandleFunc("/stats", statsHandler)
+    n := negroni.Classic()
+    n.UseHandler(mux)
+    go func() {
+        log.Println("Listening at", port)
+        http.ListenAndServe(port, n)
     }()
 
     // Get tcpdump stdout
@@ -124,7 +205,7 @@ func main() {
                 continue
             }
 
-            err = save(db, srcIp, srcPort, dstIp, dstPort, nBytes)
+            err = save(srcIp, srcPort, dstIp, dstPort, nBytes)
             if err != nil {
                 log.Fatal(err)
             }
